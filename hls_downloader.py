@@ -24,6 +24,7 @@ from typing import Optional, List, Dict, Any, Tuple, Callable
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib3.exceptions import IncompleteRead, ProtocolError as Urllib3ProtocolError
 
 # ---------------------------------------------------------------------------
 # Optional AES-128 decryption
@@ -222,6 +223,19 @@ class HLSDownloader:
         self._extra_headers = {}
         if "Referer" not in self.session.headers:
             self._extra_headers["Referer"] = "https://www.classin.com/"
+
+    # ------------------------------------------------------------------
+    # Connection pool management
+    # ------------------------------------------------------------------
+    def _clear_connection_pool(self):
+        """Drop cached connections so retries hit a fresh CDN edge node."""
+        try:
+            for prefix in ("https://", "http://"):
+                adapter = self.session.adapters.get(prefix)
+                if adapter and hasattr(adapter, 'poolmanager'):
+                    adapter.poolmanager.clear()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -432,19 +446,18 @@ class HLSDownloader:
                         _bytes_downloaded[0] += len(data)
                     return idx, dest, None
 
-                except requests.RequestException as exc:
+                except (
+                    requests.RequestException,
+                    IOError, ConnectionError, TimeoutError,
+                    IncompleteRead, Urllib3ProtocolError,
+                    Exception,  # catch-all — any error triggers resume+retry
+                ) as exc:
                     if attempt < self.retries:
+                        self._clear_connection_pool()
                         wait = min(2 ** attempt, 60)
-                        logger.warning("Retry %d/%d for seg %d after %.0fs  (%s)",
-                                       attempt, self.retries, idx, wait, exc)
-                        time.sleep(wait)
-                    else:
-                        return idx, None, str(exc)
-                except (IOError, ConnectionError, TimeoutError) as exc:
-                    if attempt < self.retries:
-                        wait = min(2 ** attempt, 60)
-                        logger.warning("Retry %d/%d for seg %d after %.0fs  (%s)",
-                                       attempt, self.retries, idx, wait, exc)
+                        logger.warning("Retry %d/%d for seg %d after %.0fs  (%s: %s)",
+                                       attempt, self.retries, idx, wait,
+                                       type(exc).__name__, exc)
                         time.sleep(wait)
                     else:
                         return idx, None, str(exc)
@@ -621,13 +634,15 @@ class HLSDownloader:
                 logger.info("MP4 done: %s  (%.1f MiB)", output_path, size_mb)
                 return output_path.resolve()
 
-            except (requests.RequestException, IOError, ConnectionError, TimeoutError) as exc:
+            except Exception as exc:
                 resume_from = output_path.stat().st_size if output_path.exists() else 0
                 downloaded = resume_from
                 if attempt < self.retries:
+                    self._clear_connection_pool()
                     wait = min(2 ** attempt, 60)
-                    logger.warning("MP4 interrupted (attempt %d/%d) after %.0fs: %s",
-                                   attempt, self.retries, time.time() - attempt_start, exc)
+                    logger.warning("MP4 interrupted (attempt %d/%d) after %.0fs: %s: %s",
+                                   attempt, self.retries, time.time() - attempt_start,
+                                   type(exc).__name__, exc)
                     logger.info("Will resume from byte %d after %.0fs...", resume_from, wait)
                     if progress_callback:
                         progress_callback(downloaded, total or downloaded * 2, 0, "retrying")
