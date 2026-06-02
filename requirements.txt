@@ -1,0 +1,11 @@
+requests>=2.25.0
+tqdm>=4.45.0
+
+# HLS AES-128 解密支持 (可选)
+pycryptodome>=3.10.0
+
+# CDP 自动捕获视频流地址 (可选)
+websocket-client>=1.4.0
+
+# Frida 原生视频流捕获 — ijkplayer/FFmpeg (可选)
+frida-tools>=12.0.0
