@@ -14,6 +14,7 @@ import sys
 import time
 import json
 import logging
+import threading
 import subprocess
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -21,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Optional AES-128 decryption
@@ -184,13 +187,16 @@ class HLSDownloader:
         timeout: int = 30,
         retries: int = 10,
         verify_ssl: bool = True,
+        min_speed: float = 1024.0,   # bytes/sec – abort segment if slower than this
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.max_workers = max_workers
-        self.timeout = timeout
+        self.connect_timeout = 15
+        self.read_timeout = timeout    # per-chunk read timeout
         self.retries = retries
         self.verify_ssl = verify_ssl
+        self.min_speed = min_speed
 
         self.session = requests.Session()
         self.session.headers.update(headers or {})
@@ -200,6 +206,17 @@ class HLSDownloader:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
         self.session.headers.setdefault("Referer", "https://www.classin.com/")
+
+        # Enlarge connection pool so concurrent workers don't starve each other.
+        # pool_connections = max hosts cached, pool_maxsize = max conns per host.
+        pool_size = max(max_workers * 2, 20)
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=Retry(total=0),  # we handle retries ourselves
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
         # Optional referer for ClassIn CDNs
         self._extra_headers = {}
@@ -332,11 +349,15 @@ class HLSDownloader:
         key_cache: Dict[str, bytes] = {}
         _start_time = time.time()
         _bytes_downloaded = [0]  # mutable for closure access
+        _lock = threading.Lock()  # guard _bytes_downloaded
 
         def _get_key(key_uri: str) -> bytes:
             if key_uri not in key_cache:
                 logger.info("Downloading AES-128 key: %s", key_uri)
-                resp = self.session.get(key_uri, timeout=self.timeout)
+                resp = self.session.get(
+                    key_uri,
+                    timeout=(self.connect_timeout, self.read_timeout),
+                )
                 resp.raise_for_status()
                 key_cache[key_uri] = resp.content
             return key_cache[key_uri]
@@ -347,9 +368,37 @@ class HLSDownloader:
 
             for attempt in range(1, self.retries + 1):
                 try:
-                    resp = self.session.get(url, timeout=self.timeout)
+                    # ── stream the segment to disk + track speed ──
+                    resp = self.session.get(
+                        url,
+                        stream=True,                          # ★ 关键：流式下载
+                        timeout=(self.connect_timeout, self.read_timeout),
+                    )
                     resp.raise_for_status()
-                    data = resp.content
+
+                    seg_data = bytearray()
+                    seg_start = time.time()
+                    last_progress = seg_start
+                    last_bytes = 0
+
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            seg_data.extend(chunk)
+                            # ── speed check every 5 seconds ──
+                            now = time.time()
+                            if now - last_progress >= 5:
+                                elapsed = now - seg_start
+                                speed = len(seg_data) / elapsed if elapsed > 0 else 0
+                                last_progress = now
+                                if speed < self.min_speed and elapsed > 10:
+                                    # Too slow — abort and retry
+                                    resp.close()
+                                    raise IOError(
+                                        f"Segment {idx} speed {speed/1024:.0f} KB/s "
+                                        f"below minimum {self.min_speed/1024:.0f} KB/s"
+                                    )
+
+                    data = bytes(seg_data)
 
                     # decrypt if needed
                     key_uri = seg.get("key_uri")
@@ -367,12 +416,21 @@ class HLSDownloader:
                         )
 
                     dest.write_bytes(data)
-                    _bytes_downloaded[0] += len(data)
+                    with _lock:
+                        _bytes_downloaded[0] += len(data)
                     return idx, dest, None
 
                 except requests.RequestException as exc:
                     if attempt < self.retries:
-                        wait = 2 ** attempt
+                        wait = min(2 ** attempt, 60)
+                        logger.warning("Retry %d/%d for seg %d after %.0fs  (%s)",
+                                       attempt, self.retries, idx, wait, exc)
+                        time.sleep(wait)
+                    else:
+                        return idx, None, str(exc)
+                except (IOError, ConnectionError, TimeoutError) as exc:
+                    if attempt < self.retries:
+                        wait = min(2 ** attempt, 60)
                         logger.warning("Retry %d/%d for seg %d after %.0fs  (%s)",
                                        attempt, self.retries, idx, wait, exc)
                         time.sleep(wait)
@@ -424,10 +482,16 @@ class HLSDownloader:
     # ------------------------------------------------------------------
     @staticmethod
     def _concatenate(segments: List[Path], output: Path):
+        """Merge TS segments using chunked copy to avoid large RAM allocations."""
         logger.info("Merging %d segments -> %s", len(segments), output)
         with open(output, "wb") as dst:
             for seg in segments:
-                dst.write(seg.read_bytes())
+                with open(seg, "rb") as src:
+                    while True:
+                        chunk = src.read(2 * 1024 * 1024)  # 2 MiB chunks
+                        if not chunk:
+                            break
+                        dst.write(chunk)
 
     # ------------------------------------------------------------------
     # Direct MP4 download (progressive download)
@@ -449,7 +513,10 @@ class HLSDownloader:
         total = 0
         downloaded = resume_from
         start_time = time.time()
-        chunk_timeout = (15, self.timeout)  # (connect, read) timeout
+        chunk_timeout = (self.connect_timeout, self.read_timeout)
+        speed_check_interval = 5  # seconds between speed checks
+        last_speed_check = time.time()
+        bytes_at_last_check = downloaded
 
         for attempt in range(1, self.retries + 1):
             try:
@@ -479,11 +546,29 @@ class HLSDownloader:
 
                 # Open file in append mode if resuming
                 mode = "ab" if resume_from > 0 else "wb"
+                seg_start = time.time()
                 with open(output_path, mode) as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
+
+                            # ── periodic speed check ──
+                            now = time.time()
+                            if now - last_speed_check >= speed_check_interval:
+                                interval = now - last_speed_check
+                                bytes_in_interval = downloaded - bytes_at_last_check
+                                speed = bytes_in_interval / interval if interval > 0 else 0
+                                last_speed_check = now
+                                bytes_at_last_check = downloaded
+                                elapsed = now - seg_start
+                                if speed < self.min_speed and elapsed > 15:
+                                    resp.close()
+                                    raise IOError(
+                                        f"MP4 download speed {speed/1024:.0f} KB/s "
+                                        f"below minimum {self.min_speed/1024:.0f} KB/s"
+                                    )
+
                             if progress_callback and total > 0:
                                 elapsed = time.time() - start_time
                                 speed = downloaded / elapsed if elapsed > 0 else 0
@@ -504,7 +589,7 @@ class HLSDownloader:
                 resume_from = output_path.stat().st_size if output_path.exists() else 0
                 downloaded = resume_from
                 if attempt < self.retries:
-                    wait = 2 ** attempt
+                    wait = min(2 ** attempt, 60)
                     logger.warning("MP4 download interrupted (attempt %d/%d): %s", attempt, self.retries, exc)
                     logger.info("Will resume from byte %d after %.0fs...", resume_from, wait)
                     if progress_callback:
