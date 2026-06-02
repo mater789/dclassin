@@ -187,7 +187,7 @@ class HLSDownloader:
         timeout: int = 30,
         retries: int = 10,
         verify_ssl: bool = True,
-        min_speed: float = 1024.0,   # bytes/sec – abort segment if slower than this
+        min_speed: float = 51200.0,  # bytes/sec (50 KB/s) – abort segment if slower
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -380,23 +380,35 @@ class HLSDownloader:
                     seg_start = time.time()
                     last_progress = seg_start
                     last_bytes = 0
+                    last_data_time = seg_start
 
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             seg_data.extend(chunk)
+                            last_data_time = time.time()
                             # ── speed check every 5 seconds ──
                             now = time.time()
                             if now - last_progress >= 5:
-                                elapsed = now - seg_start
-                                speed = len(seg_data) / elapsed if elapsed > 0 else 0
+                                interval = now - last_progress
+                                bytes_in_interval = len(seg_data) - last_bytes
+                                speed = bytes_in_interval / interval if interval > 0 else 0
                                 last_progress = now
-                                if speed < self.min_speed and elapsed > 10:
+                                last_bytes = len(seg_data)
+                                if speed < self.min_speed and (now - seg_start) > 10:
                                     # Too slow — abort and retry
                                     resp.close()
                                     raise IOError(
                                         f"Segment {idx} speed {speed/1024:.0f} KB/s "
                                         f"below minimum {self.min_speed/1024:.0f} KB/s"
                                     )
+                        else:
+                            # Empty chunk = potential stall
+                            if time.time() - last_data_time > max(self.read_timeout * 2, 60):
+                                resp.close()
+                                raise IOError(
+                                    f"Segment {idx} stalled: no data for "
+                                    f"{max(self.read_timeout * 2, 60):.0f}s"
+                                )
 
                     data = bytes(seg_data)
 
@@ -512,20 +524,27 @@ class HLSDownloader:
 
         total = 0
         downloaded = resume_from
-        start_time = time.time()
-        chunk_timeout = (self.connect_timeout, self.read_timeout)
-        speed_check_interval = 5  # seconds between speed checks
-        last_speed_check = time.time()
-        bytes_at_last_check = downloaded
+        overall_start = time.time()          # for progress display (wall clock)
 
         for attempt in range(1, self.retries + 1):
+            # ── per-attempt fresh state ──
+            last_speed_check = time.time()
+            bytes_at_last_check = downloaded
+            last_data_time = time.time()      # track stalls (no data at all)
+            attempt_start = time.time()       # for accurate speed display this attempt
+            stall_timeout = max(self.read_timeout * 2, 60)  # 60s of no data → abort
+
             try:
                 headers = {}
                 if resume_from > 0:
                     headers["Range"] = f"bytes={resume_from}-"
 
                 logger.info("Downloading MP4 (attempt %d/%d): %s", attempt, self.retries, url)
-                resp = self.session.get(url, stream=True, timeout=chunk_timeout, headers=headers)
+                resp = self.session.get(
+                    url, stream=True,
+                    timeout=(self.connect_timeout, self.read_timeout),
+                    headers=headers,
+                )
                 resp.raise_for_status()
 
                 # Handle resume response
@@ -536,6 +555,8 @@ class HLSDownloader:
                             total = int(content_range.split("/")[-1])
                         except ValueError:
                             total = resume_from + int(resp.headers.get("content-length", 0))
+                    else:
+                        total = resume_from + int(resp.headers.get("content-length", 0))
                 else:
                     total = int(resp.headers.get("content-length", 0))
                     if resume_from > 0:
@@ -543,36 +564,51 @@ class HLSDownloader:
                         logger.warning("Server doesn't support resume, restarting")
                         resume_from = 0
                         downloaded = 0
+                        # re-open in write mode
+                        mode = "wb"
+                        with open(output_path, mode) as _f:
+                            pass  # truncate
 
-                # Open file in append mode if resuming
                 mode = "ab" if resume_from > 0 else "wb"
-                seg_start = time.time()
                 with open(output_path, mode) as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
+                            dl = len(chunk)
+                            downloaded += dl
+                            last_data_time = time.time()
 
-                            # ── periodic speed check ──
+                            # ── periodic speed check (every 5s) ──
                             now = time.time()
-                            if now - last_speed_check >= speed_check_interval:
+                            if now - last_speed_check >= 5:
                                 interval = now - last_speed_check
                                 bytes_in_interval = downloaded - bytes_at_last_check
                                 speed = bytes_in_interval / interval if interval > 0 else 0
                                 last_speed_check = now
                                 bytes_at_last_check = downloaded
-                                elapsed = now - seg_start
-                                if speed < self.min_speed and elapsed > 15:
+
+                                if speed < self.min_speed and (now - attempt_start) > 15:
                                     resp.close()
                                     raise IOError(
-                                        f"MP4 download speed {speed/1024:.0f} KB/s "
-                                        f"below minimum {self.min_speed/1024:.0f} KB/s"
+                                        f"MP4 speed {speed/1024:.0f} KB/s "
+                                        f"below min {self.min_speed/1024:.0f} KB/s"
                                     )
 
                             if progress_callback and total > 0:
-                                elapsed = time.time() - start_time
-                                speed = downloaded / elapsed if elapsed > 0 else 0
-                                progress_callback(downloaded, total, speed, "downloading_mp4")
+                                # show speed based on this attempt only (more accurate)
+                                attempt_elapsed = time.time() - attempt_start
+                                attempt_speed = (downloaded - resume_from) / attempt_elapsed \
+                                    if attempt_elapsed > 0 else 0
+                                progress = resume_from + (downloaded - resume_from)
+                                progress_callback(downloaded, total, attempt_speed, "downloading_mp4")
+                        else:
+                            # Empty chunk from iter_content = potential stall
+                            # (some servers send empty chunks as keep-alive)
+                            if time.time() - last_data_time > stall_timeout:
+                                resp.close()
+                                raise IOError(
+                                    f"MP4 download stalled: no data for {stall_timeout:.0f}s"
+                                )
 
                 # Verify download
                 if total > 0 and downloaded < total:
@@ -590,7 +626,8 @@ class HLSDownloader:
                 downloaded = resume_from
                 if attempt < self.retries:
                     wait = min(2 ** attempt, 60)
-                    logger.warning("MP4 download interrupted (attempt %d/%d): %s", attempt, self.retries, exc)
+                    logger.warning("MP4 interrupted (attempt %d/%d) after %.0fs: %s",
+                                   attempt, self.retries, time.time() - attempt_start, exc)
                     logger.info("Will resume from byte %d after %.0fs...", resume_from, wait)
                     if progress_callback:
                         progress_callback(downloaded, total or downloaded * 2, 0, "retrying")
