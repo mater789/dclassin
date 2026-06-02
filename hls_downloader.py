@@ -519,40 +519,219 @@ class HLSDownloader:
                         dst.write(chunk)
 
     # ------------------------------------------------------------------
-    # Direct MP4 download (progressive download)
+    # Direct MP4 download — chunked via Range requests
     # ------------------------------------------------------------------
     def _download_mp4(self, url: str, output: Optional[str] = None,
                       progress_callback: Optional[Callable] = None) -> Path:
-        """Download a single MP4 file with resume + retry support."""
+        """
+        Download an MP4 file using parallel Range requests.
+
+        Each chunk (default 20 MiB) gets its own HTTP connection and timeout,
+        so a single stalled connection never blocks the whole download.
+        """
         output_path = self._resolve_output(output, url)
         if output_path.suffix.lower() != ".mp4":
             output_path = output_path.with_suffix(".mp4")
 
-        # Check for existing partial download
+        chunk_size = 20 * 1024 * 1024  # 20 MiB per chunk
+
+        # ── 1. HEAD request to discover total size ──
+        logger.info("Probing: %s", url)
+        try:
+            head = self.session.head(url, timeout=(self.connect_timeout, self.read_timeout))
+            head.raise_for_status()
+        except Exception:
+            # Some CDNs reject HEAD — fall back to GET with Range 0-0
+            head = self.session.get(
+                url,
+                headers={"Range": "bytes=0-0"},
+                timeout=(self.connect_timeout, self.read_timeout),
+            )
+            head.raise_for_status()
+
+        total = int(head.headers.get("Content-Length", 0))
+        accept_ranges = head.headers.get("Accept-Ranges", "").lower()
+        # Also check if server responded 206 to our Range probe
+        supports_range = accept_ranges == "bytes" or head.status_code == 206
+
+        if total == 0:
+            raise ValueError("Cannot determine file size — server returned Content-Length: 0")
+
+        logger.info("Total size: %.1f MiB  (Range support: %s)",
+                     total / 1048576, "yes" if supports_range else "no")
+
+        if not supports_range:
+            # Fallback: single-connection streaming (server doesn't support Range)
+            logger.warning("Server doesn't support Range — falling back to single connection")
+            return self._download_mp4_stream(url, output_path, total, progress_callback)
+
+        # ── 2. Check for existing partial file ──
         resume_from = 0
         if output_path.exists():
             resume_from = output_path.stat().st_size
             if resume_from > 0:
-                logger.info("Resuming from byte %d (%.1f MB)", resume_from, resume_from / 1048576)
+                logger.info("Resuming from byte %d (%.1f MB) — will re-download final chunk",
+                             resume_from, resume_from / 1048576)
 
-        total = 0
+        # ── 3. Build chunk list (skip already-downloaded chunks) ──
+        chunks: List[Tuple[int, int, int]] = []  # (start, end, index)
+        idx = 0
+        pos = 0
+        while pos < total:
+            end = min(pos + chunk_size - 1, total - 1)
+            if end >= resume_from:  # only download chunks we don't have yet
+                chunks.append((pos, end, idx))
+            idx += 1
+            pos = end + 1
+
+        total_chunks = idx
+        pending = len(chunks)
+        logger.info("Chunks: %d total, %d to download (%.1f MiB each)",
+                     total_chunks, pending, chunk_size / 1048576)
+
+        # ── 4. Download chunks in parallel ──
+        tmp_dir = self.output_dir / f".tmp_mp4_{int(time.time() * 1000)}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        _bytes_done = [0]
+        _lock = threading.Lock()
+        _start = time.time()
+
+        def _dl_chunk(start: int, end: int, cidx: int) -> Tuple[int, Optional[Path], Optional[str]]:
+            """Download one byte-range chunk to a temp segment file."""
+            seg_path = tmp_dir / f"chunk_{cidx:06d}.bin"
+            headers = {"Range": f"bytes={start}-{end}"}
+
+            for attempt in range(1, self.retries + 1):
+                try:
+                    resp = self.session.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        timeout=(self.connect_timeout, self.read_timeout),
+                    )
+                    resp.raise_for_status()
+
+                    expected = end - start + 1
+                    data = bytearray()
+                    last_data = time.time()
+
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            data.extend(chunk)
+                            last_data = time.time()
+                        elif time.time() - last_data > max(self.read_timeout * 2, 60):
+                            resp.close()
+                            raise IOError("Chunk stalled")
+
+                    if len(data) != expected:
+                        raise IOError(
+                            f"Chunk size mismatch: got {len(data)}, expected {expected}"
+                        )
+
+                    seg_path.write_bytes(data)
+                    with _lock:
+                        _bytes_done[0] += len(data)
+                    return cidx, seg_path, None
+
+                except Exception as exc:
+                    if attempt < self.retries:
+                        self._clear_connection_pool()
+                        wait = min(2 ** attempt, 60)
+                        logger.warning("Chunk %d retry %d/%d after %.0fs (%s: %s)",
+                                       cidx, attempt, self.retries, wait,
+                                       type(exc).__name__, exc)
+                        time.sleep(wait)
+                    else:
+                        return cidx, None, str(exc)
+
+            return cidx, None, "max retries"
+
+        # Submit all chunks
+        workers = min(self.max_workers, pending) if pending > 0 else 1
+        chunk_results: Dict[int, Path] = {}
+        chunk_errors: List[str] = []
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            fut_map = {
+                pool.submit(_dl_chunk, s, e, i): i
+                for s, e, i in chunks
+            }
+            for fut in as_completed(fut_map):
+                cidx, seg_path, err = fut.result()
+                if err:
+                    chunk_errors.append(f"Chunk {cidx}: {err}")
+                elif seg_path:
+                    chunk_results[cidx] = seg_path
+
+                done = len(chunk_results)
+                if progress_callback:
+                    pct = resume_from + _bytes_done[0]
+                    elapsed = time.time() - _start
+                    speed = _bytes_done[0] / elapsed if elapsed > 0 else 0
+                    progress_callback(pct, total, speed, "downloading_mp4")
+                logger.info("Chunks: %d/%d done", done, pending)
+
+        if chunk_errors:
+            _rmtree(tmp_dir)
+            raise RuntimeError(f"Failed chunks: {'; '.join(chunk_errors[:5])}")
+
+        # ── 5. Assemble final file ──
+        logger.info("Assembling %d chunks -> %s", total_chunks, output_path)
+
+        # Read existing partial file content (if resuming)
+        existing_data = b""
+        if resume_from > 0 and output_path.exists():
+            existing_data = output_path.read_bytes()
+            if len(existing_data) != resume_from:
+                logger.warning("Existing file size mismatch, restarting from scratch")
+                existing_data = b""
+                resume_from = 0
+
+        with open(output_path, "wb") as dst:
+            if existing_data:
+                dst.write(existing_data)
+            for cidx in sorted(chunk_results.keys()):
+                seg_path = chunk_results[cidx]
+                with open(seg_path, "rb") as src:
+                    while True:
+                        buf = src.read(2 * 1024 * 1024)
+                        if not buf:
+                            break
+                        dst.write(buf)
+
+        # Clean up
+        _rmtree(tmp_dir)
+
+        size_mb = output_path.stat().st_size / 1048576
+        logger.info("MP4 done: %s  (%.1f MiB)", output_path, size_mb)
+        if progress_callback:
+            progress_callback(total, total, 0, "done")
+        return output_path.resolve()
+
+    # ------------------------------------------------------------------
+    # Fallback: single-connection streaming (for servers without Range)
+    # ------------------------------------------------------------------
+    def _download_mp4_stream(self, url: str, output_path: Path, total: int,
+                             progress_callback: Optional[Callable] = None) -> Path:
+        """Single-connection streaming download with speed monitoring."""
+        resume_from = 0
+        if output_path.exists():
+            resume_from = output_path.stat().st_size
+            if resume_from > 0:
+                logger.info("Resuming from byte %d", resume_from)
+
         downloaded = resume_from
-        overall_start = time.time()          # for progress display (wall clock)
 
         for attempt in range(1, self.retries + 1):
-            # ── per-attempt fresh state ──
             last_speed_check = time.time()
             bytes_at_last_check = downloaded
-            last_data_time = time.time()      # track stalls (no data at all)
-            attempt_start = time.time()       # for accurate speed display this attempt
-            stall_timeout = max(self.read_timeout * 2, 60)  # 60s of no data → abort
+            attempt_start = time.time()
 
             try:
                 headers = {}
                 if resume_from > 0:
                     headers["Range"] = f"bytes={resume_from}-"
 
-                logger.info("Downloading MP4 (attempt %d/%d): %s", attempt, self.retries, url)
                 resp = self.session.get(
                     url, stream=True,
                     timeout=(self.connect_timeout, self.read_timeout),
@@ -560,79 +739,43 @@ class HLSDownloader:
                 )
                 resp.raise_for_status()
 
-                # Handle resume response
-                if resp.status_code == 206:
-                    content_range = resp.headers.get("Content-Range", "")
-                    if "bytes" in content_range:
-                        try:
-                            total = int(content_range.split("/")[-1])
-                        except ValueError:
-                            total = resume_from + int(resp.headers.get("content-length", 0))
-                    else:
-                        total = resume_from + int(resp.headers.get("content-length", 0))
-                else:
-                    total = int(resp.headers.get("content-length", 0))
-                    if resume_from > 0:
-                        # Server doesn't support resume, restart from 0
-                        logger.warning("Server doesn't support resume, restarting")
-                        resume_from = 0
-                        downloaded = 0
-                        # re-open in write mode
-                        mode = "wb"
-                        with open(output_path, mode) as _f:
-                            pass  # truncate
+                if resp.status_code != 206 and resume_from > 0:
+                    logger.warning("Server doesn't support resume, restarting")
+                    resume_from = 0
+                    downloaded = 0
 
                 mode = "ab" if resume_from > 0 else "wb"
                 with open(output_path, mode) as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
-                            dl = len(chunk)
-                            downloaded += dl
-                            last_data_time = time.time()
+                            downloaded += len(chunk)
 
-                            # ── periodic speed check (every 5s) ──
                             now = time.time()
                             if now - last_speed_check >= 5:
                                 interval = now - last_speed_check
-                                bytes_in_interval = downloaded - bytes_at_last_check
-                                speed = bytes_in_interval / interval if interval > 0 else 0
+                                speed = (downloaded - bytes_at_last_check) / interval \
+                                    if interval > 0 else 0
                                 last_speed_check = now
                                 bytes_at_last_check = downloaded
-
                                 if speed < self.min_speed and (now - attempt_start) > 15:
                                     resp.close()
                                     raise IOError(
-                                        f"MP4 speed {speed/1024:.0f} KB/s "
-                                        f"below min {self.min_speed/1024:.0f} KB/s"
+                                        f"Speed {speed/1024:.0f} KB/s below min"
                                     )
 
                             if progress_callback and total > 0:
-                                # show speed based on this attempt only (more accurate)
                                 attempt_elapsed = time.time() - attempt_start
                                 attempt_speed = (downloaded - resume_from) / attempt_elapsed \
                                     if attempt_elapsed > 0 else 0
-                                progress = resume_from + (downloaded - resume_from)
                                 progress_callback(downloaded, total, attempt_speed, "downloading_mp4")
-                        else:
-                            # Empty chunk from iter_content = potential stall
-                            # (some servers send empty chunks as keep-alive)
-                            if time.time() - last_data_time > stall_timeout:
-                                resp.close()
-                                raise IOError(
-                                    f"MP4 download stalled: no data for {stall_timeout:.0f}s"
-                                )
 
-                # Verify download
-                if total > 0 and downloaded < total:
-                    raise IOError(f"Incomplete download: {downloaded}/{total} bytes")
+                if downloaded >= total:
+                    if progress_callback:
+                        progress_callback(downloaded, downloaded, 0, "done")
+                    return output_path.resolve()
 
-                if progress_callback:
-                    progress_callback(downloaded, downloaded, 0.0, "done")
-
-                size_mb = output_path.stat().st_size / 1048576
-                logger.info("MP4 done: %s  (%.1f MiB)", output_path, size_mb)
-                return output_path.resolve()
+                raise IOError(f"Incomplete: {downloaded}/{total} bytes")
 
             except Exception as exc:
                 resume_from = output_path.stat().st_size if output_path.exists() else 0
@@ -640,18 +783,14 @@ class HLSDownloader:
                 if attempt < self.retries:
                     self._clear_connection_pool()
                     wait = min(2 ** attempt, 60)
-                    logger.warning("MP4 interrupted (attempt %d/%d) after %.0fs: %s: %s",
-                                   attempt, self.retries, time.time() - attempt_start,
-                                   type(exc).__name__, exc)
-                    logger.info("Will resume from byte %d after %.0fs...", resume_from, wait)
+                    logger.warning("Stream retry %d/%d: %s: %s",
+                                   attempt, self.retries, type(exc).__name__, exc)
                     if progress_callback:
-                        progress_callback(downloaded, total or downloaded * 2, 0, "retrying")
+                        progress_callback(downloaded, total, 0, "retrying")
                     time.sleep(wait)
                 else:
-                    logger.error("MP4 download failed after %d attempts: %s", self.retries, exc)
                     raise
 
-        # Should not reach here
         raise RuntimeError("Max retries exceeded")
 
     # ------------------------------------------------------------------
