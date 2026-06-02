@@ -155,14 +155,42 @@ ffmpeg -i input.ts -c:v libx264 -c:a aac -movflags +faststart output.mp4
 
 ```
 classin-downloader/
-├── main.py              # 主程序入口
+├── main.py              # 主程序入口 (CLI)
+├── gui.py               # 图形界面 (tkinter)
 ├── hls_downloader.py    # HLS 视频下载引擎
-├── capture.py           # CDP 自动捕获模块
+├── capture.py           # CDP / 代理 自动捕获模块
+├── frida_capture.py     # Frida 原生流捕获
+├── frida_hook.js        # Frida JS hook 脚本
+├── remuxer.py           # 数据包封装为 MP4
 ├── requirements.txt     # Python 依赖
 ├── launch_capture.bat   # Windows 一键捕获脚本
 ├── download_url.bat     # Windows 一键下载脚本
 └── README.md            # 本文件
 ```
+
+## 打包为 EXE
+
+使用 PyInstaller 将工具打包为独立可执行文件（无需安装 Python）：
+
+### 1. 安装 PyInstaller
+
+```bash
+pip install pyinstaller
+```
+
+### 2. 构建
+
+```bash
+# GUI 图形界面版（无控制台窗口，双击运行）
+pyinstaller --onefile --noconsole --name ClassInDownloader --add-data "frida_hook.js;." --hidden-import websocket --hidden-import frida --hidden-import Crypto gui.py
+
+# CLI 命令行版（带控制台窗口）
+pyinstaller --onefile --console --name ClassInDownloader_console --add-data "frida_hook.js;." --hidden-import websocket --hidden-import frida --hidden-import Crypto main.py
+```
+
+构建完成后，exe 文件位于 `dist/` 目录：
+- `ClassInDownloader.exe` — 图形界面版（约 60MB）
+- `ClassInDownloader_console.exe` — 命令行版（约 55MB）
 
 ## 免责声明
 
